@@ -7,11 +7,12 @@ import numpy as np
 from math import sqrt
 
 def u(action, weight, date, resp):
-    '''args:
-    action (n, 1)
-    weight (n, 1)
-    date (n, 1)
-    resp (n, 1)
+    '''Utility/reward function for trading actions
+    args:
+        action (n, 1)
+        weight (n, 1)
+        date (n, 1)
+        resp (n, 1)
     '''
     date_set = torch.unique(date).int()
     P = torch.zeros(date_set.size())
@@ -22,15 +23,14 @@ def u(action, weight, date, resp):
     return min(max(t.item(),0), 6)* P.sum()
 
 class TradingVAE(nn.Module):
-    def __init__(self, meta, latent_dim = 13):
+    def __init__(self, meta, latent_dim = 16):
         '''
-        Variational autoencoder for trading data
+        Variational autoencoder for Jane Street trading data
         args:
             latent_dim (int): number of latent variables
             meta: (29, 130) tensor of meta-features
         '''
         super(TradingVAE, self).__init__()
-       
         self.dim = latent_dim
         self.relu = nn.ReLU()
 
@@ -39,22 +39,23 @@ class TradingVAE(nn.Module):
         self.conv= Conv1dUntiedBias(130,29,1,1) 
         self.meta_bias = None
         #encoder
-        self.lin1 = nn.Linear(130, 80) 
-        self.lin_mu = nn.Linear(80, self.dim)
-        self.lin_logvar = nn.Linear(80, self.dim)
+        self.lin1 = nn.Linear(131, 90) 
+        self.lin_mu = nn.Linear(90, self.dim)
+        self.lin_logvar = nn.Linear(90, self.dim)
         #decoder 
-        self.lin2 = nn.Linear(self.dim, 80)
-        self.lin3 = nn.Linear(80,130)
+        self.lin2 = nn.Linear(self.dim, 90)
+        self.lin3 = nn.Linear(90,131)
 
     def encode(self, x):
         '''
         args:
-            x: (n, 130) feature tensor
+            x (n, 131) tensor: batch, (features 0 -- 129 + weight)
         '''
         if self.training or self.meta_bias is None:
-            self.meta_bias = self.relu(self.conv(self.meta)).view(1,-1)
+            self.meta_bias = F.pad(self.relu(self.conv(self.meta)).view(1,-1),
+                                    pad = (0,1), value = 0)
         x += self.meta_bias.repeat(x.size(0), 1)
-        y = self.relu( self.lin1(x))
+        y = self.relu(self.lin1(x))
         return self.lin_mu(y), self.lin_logvar(y)
 
     def decode(self, z):
@@ -79,9 +80,9 @@ class TradingVAE(nn.Module):
 
 def VAEloss(recons, inputs,
             mu, logvar, KL_weight = 1.0):
-    recon_loss = F.mse_loss( recons, inputs)
-    D_KL = torch.mean(-0.5 + torch.sum(1 + logvar - mu**2 -logvar.exp(), dim =1), dim = 0)
-    return recon_loss + KL_weight*D_KL 
+    recon_loss = F.mse_loss(recons, inputs)
+    D_KL = -0.5*torch.sum(1 + logvar - mu**2 -logvar.exp())
+    return (recon_loss + KL_weight*D_KL, recon_loss)
 
 class Conv1dUntiedBias(nn.Module):
     def __init__(self, size, in_channels, out_channels,
