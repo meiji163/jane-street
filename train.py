@@ -21,7 +21,7 @@ if __name__ == "__main__":
     comp = np.load("comp_dataset.npz")
     states = torch.from_numpy(comp["state"])
     print(f"Data length: {states.shape[0]}")
-    loader = DataLoader(states, batch_size = args.b, pin_memory = True,
+    loader = DataLoader(states[:,:-1], batch_size = args.b, pin_memory = True,
                         shuffle = True, num_workers = 1)
  
     metadata = pd.read_csv("features.csv")
