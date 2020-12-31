@@ -8,11 +8,10 @@ import numpy as np
 import pandas as pd
 from math import sqrt
 
-
 def synth_data( fts, means, stds):
     '''Fill in missing features (0 -- 129) with samples from MLE Gaussian
     args:
-        features: (n, 130) np.array
+        features: (n, 130) numpy array
         means: (130,) means of features
         stds: (130,) standard deviations of features'''
     nan = np.nonzero(np.where(fts != fts, 1., 0.))
@@ -20,13 +19,17 @@ def synth_data( fts, means, stds):
         fts[i,j] = np.random.normal(loc = means[j], scale = stds[j])
     return fts 
  
-def TradingData(Dataset):
+class TradingData(Dataset):
     '''Training dataset from numpy zipped file.
+    For times series, returns sequence of length `seq_len` of (features, weights, returns, time).
+    args:
+        npz_path (str): path to npz 
     kwargs:
         synth (bool): if True, synthesize missing data
         ts (bool): if True, process into time series data
         seq_len (int): sequence length of time series data'''
     def __init__(self, npz_path, **kwargs): 
+        super(TradingData, self).__init__()
         self.ts = kwargs.get("seq", True)
         self.synth = kwargs.get("synth", True)
         self.seq_len = kwargs.get("seq_len", 50)
@@ -36,12 +39,13 @@ def TradingData(Dataset):
         means = df["mean"]
         stds = df["std"]
         self.time = torch.from_numpy(df["date"])
-        if synth:
+        if self.synth:
             self.data = torch.from_numpy(synth_data(states[:,:-1], means, stds))
         else:
             self.data = torch.from_numpy(states)
-        self.meta = torch.from_numpy(df["meta"]).T
-        self.weight = torch.from_numpy(states[:,-1])
+        self.meta = torch.Tensor(df["meta"])
+        self.weight = torch.from_numpy(states[:,-1]).unsqueeze(1)
+        self.resp = torch.from_numpy(df["resp"]) if self.ts else None
 
     def __len__(self):
         if self.ts:
@@ -49,30 +53,30 @@ def TradingData(Dataset):
         return self.data.shape[0] - self.seq_len + 1
 
     def __getitem__(self, idx):
-        if not self.seq:
+        if not self.ts:
             return self.data[idx], self.weight[idx]
-        return self.data[idx:idx+seq_len, :], self.weight[idx:idx+seq_len,:] 
-         
+        s = self.seq_len 
+        return (self.data[idx:idx+s], self.weight[idx:idx+s], 
+                self.resp[idx:idx+s], self.time[idx:idx+s])
 
-def u(action, weight, n_dates, resp):
+def u(action, weight, dates, resp):
     '''Utility/reward function for trading actions
     args:
-        action (n, 1) trade or not 0/1
-        weight (n, 1) tensor
-        n_dates (int): number of unique dates
-        resp (n, 1): returns for trades
-    '''
-    P = torch.zeros(date_set.size())
-    for d in date_set:
-        idx = torch.nonzero(torch.where(date == d, 1.,0.))
+        action (n, 1): trade or not 0/1
+        weight (n, 1)
+        dates (n,1)
+        resp (n, 1): returns for trades'''
+    P = torch.zeros(dates.size())
+    for d in dates:
+        idx = torch.nonzero(torch.where(dates == d, 1.,0.))
         P[d] = (action[idx]*weight[idx]*resp[idx]).sum()
-    t = math.sqrt(250./date.size(0))* P.sum()/torch.norm(P)
-    return min(max(t.item(),0), 6)* P.sum()
+    t = math.sqrt(250./dates.size(0))*P.sum()/torch.norm(P)
+    return min(max(t.item(),0), 6)*P.sum()
 
 class TradingVAE(nn.Module):
     def __init__(self, meta, latent_dim = 16):
         '''
-        Variational autoencoder for Jane Street trading data
+        Variational autoencoder for Jane Street trading data. Encodes features 0 - 129.
         args:
             latent_dim (int): number of latent variables
             meta: (29, 130) tensor of meta-features
@@ -94,7 +98,7 @@ class TradingVAE(nn.Module):
         self.lin3 = nn.Linear(90,130)
 
     def encode(self, x):
-        '''
+        ''' Encodes as Guassian latent variable with params (mean, standard deviation)
         args:
             x (n, 130) tensor: (batch, feature) 
         '''
@@ -131,11 +135,29 @@ def VAEloss(recons, inputs,
     return (recon_loss + KL_weight*D_KL, recon_loss)
 
 class TradingRNN(nn.Module):
-    def __init__(self):
-        self.embedding = ...
-        self.rnn = nn.GRU(131,256, 
-        self.lin = nn.Linear()
+    '''Simple stacked GRU model. Uses inputs from TradingVAE'''
+    def __init__(self, encoder, n_layers = 2):
+        super(TradingRNN, self).__init__()
+        self.encoder = encoder
+        self.n_lyrs = 2 
+        self.n_hidden= 128 
+        self.rnn = nn.GRU(33, self.n_hidden,
+                          num_layers = self.n_lyrs,
+                          batch_first = True,
+                          dropout = 0.1)
+        self.lin = nn.Linear(128, 2)
 
+    def forward(self, fts, weight, state = None):
+        mu, logvar = self.encoder.encode(fts.view(-1,130))
+        mu = mu.view(*fts.shape[:-1], -1)
+        logvar = logvar.view(*fts.shape[:-1], -1)
+        x = torch.cat( (mu, logvar, weight), dim = 2)
+        if state is None:
+            state = torch.zeros((self.n_lyrs, x.shape[0], self.n_hidden),
+                                device = x.device)
+        y, state = self.rnn(x, state)
+        out = self.lin(y.view(-1, y.shape[-1]))
+        return out, state
 
 class Conv1dUntiedBias(nn.Module):
     def __init__(self, size, in_channels, out_channels,

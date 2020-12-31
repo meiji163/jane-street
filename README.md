@@ -1,7 +1,7 @@
 # Jane Street Market Prediction
 
 ## Data
-[npz data](https://drive.google.com/file/d/17zcBLQxuWv_vQFJj8ZmRLJcO6w2xNe65/view?usp=sharing) (1 GB)
+[npz data](https://drive.google.com/file/d/1BVKSILxLOk45f8Zxh3cS2l_E-vNaTA2y/view?usp=sharing)
 
 `data = np.load("js_data.npz")`
 * "states" has columns (features 0 -- 129, weight)
