@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
 from math import sqrt
+import os
 
 def synth_data( fts, means, stds):
     '''Fill in missing features (0 -- 129) with samples from MLE Gaussian
@@ -17,11 +18,12 @@ def synth_data( fts, means, stds):
     nan = np.nonzero(np.where(fts != fts, 1., 0.))
     for i, j in zip(*nan):
         fts[i,j] = np.random.normal(loc = means[j], scale = stds[j])
+    np.savez_compressed("data/synth_data", features = fts)
     return fts 
  
 class TradingData(Dataset):
     '''Training dataset from numpy zipped file.
-    For times series, returns sequence of length `seq_len` of (features, weights, returns, time).
+    For times series, returns sequence of length `seq_len` of (features, weights, target, reward) 
     args:
         npz_path (str): path to npz 
     kwargs:
@@ -40,7 +42,11 @@ class TradingData(Dataset):
         stds = df["std"]
         self.time = torch.from_numpy(df["date"])
         if self.synth:
-            self.data = torch.from_numpy(synth_data(states[:,:-1], means, stds))
+            if os.path.exists("data/synth_data.npz"):
+                synth = np.load("data/synth_data.npz")
+                self.data = torch.from_numpy(synth["features"])
+            else: 
+                self.data = torch.from_numpy(synth_data(states[:,:-1], means, stds))
         else:
             self.data = torch.from_numpy(states)
         self.meta = torch.Tensor(df["meta"])
@@ -48,7 +54,7 @@ class TradingData(Dataset):
         self.resp = torch.from_numpy(df["resp"]) if self.ts else None
 
     def __len__(self):
-        if self.ts:
+        if not self.ts:
             return self.data.shape[0]
         return self.data.shape[0] - self.seq_len + 1
 
@@ -56,8 +62,11 @@ class TradingData(Dataset):
         if not self.ts:
             return self.data[idx], self.weight[idx]
         s = self.seq_len 
-        return (self.data[idx:idx+s], self.weight[idx:idx+s], 
-                self.resp[idx:idx+s], self.time[idx:idx+s])
+        fts = self.data[idx:idx+s]
+        wts = self.weight[idx:idx+s]
+        rets = self.resp[idx:idx+s]
+        targ, reward = greedy_seq(rets)
+        return fts, wts, targ 
 
 def u(action, weight, dates, resp):
     '''Utility/reward function for trading actions
@@ -70,7 +79,7 @@ def u(action, weight, dates, resp):
     for d in dates:
         idx = torch.nonzero(torch.where(dates == d, 1.,0.))
         P[d] = (action[idx]*weight[idx]*resp[idx]).sum()
-    t = math.sqrt(250./dates.size(0))*P.sum()/torch.norm(P)
+    t = sqrt(250./dates.size(0))*P.sum()/torch.norm(P)
     return min(max(t.item(),0), 6)*P.sum()
 
 class TradingVAE(nn.Module):
@@ -84,11 +93,6 @@ class TradingVAE(nn.Module):
         super(TradingVAE, self).__init__()
         self.dim = latent_dim
         self.relu = nn.ReLU()
-
-        # meta-features contributes bias to corresponding features 
-        self.meta = meta.unsqueeze(0)
-        self.conv= Conv1dUntiedBias(130,29,1,1) 
-        self.meta_bias = None
         #encoder
         self.lin1 = nn.Linear(130, 90) 
         self.lin_mu = nn.Linear(90, self.dim)
@@ -100,11 +104,8 @@ class TradingVAE(nn.Module):
     def encode(self, x):
         ''' Encodes as Guassian latent variable with params (mean, standard deviation)
         args:
-            x (n, 130) tensor: (batch, feature) 
+            x: (batch, 130) 
         '''
-        if self.training or self.meta_bias is None:
-            self.meta_bias = self.relu(self.conv(self.meta)).view(1,-1)
-        x += self.meta_bias.repeat(x.size(0), 1)
         y = self.relu(self.lin1(x))
         return self.lin_mu(y), self.lin_logvar(y)
 
@@ -134,29 +135,57 @@ def VAEloss(recons, inputs,
     D_KL = -0.5*torch.sum(1 + logvar - mu**2 -logvar.exp())
     return (recon_loss + KL_weight*D_KL, recon_loss)
 
+def greedy_seq(returns):
+    '''Returns greedy action sequence and the average total return.
+    args:
+        returns (batch, seq_len, 1) or (batch,seq_len, 5)
+    '''
+    main_ret = returns[:,0]
+    act = torch.zeros(main_ret.shape, device = returns.device)
+    do_trade = torch.where(main_ret>0)
+    act[do_trade] = 1.
+    tot_ret = returns[do_trade].sum()
+    return act.long(), tot_ret
+
 class TradingRNN(nn.Module):
-    '''Simple stacked GRU model. Uses inputs from TradingVAE'''
-    def __init__(self, encoder, n_layers = 2):
+    '''Simple stacked GRU model
+    args:
+        meta (29,130): meta-features
+        n_lyrs (int): number of GRU layers'''
+    def __init__(self, meta, n_lyrs = 2):
         super(TradingRNN, self).__init__()
-        self.encoder = encoder
-        self.n_lyrs = 2 
-        self.n_hidden= 128 
-        self.rnn = nn.GRU(33, self.n_hidden,
+        self.meta = meta.unsqueeze(0)
+        self.conv = Conv1dUntiedBias(130,29,1,1) 
+        self.meta_bias = None 
+        self.meta_weight = Parameter(torch.randn(1))
+       
+        self.relu = nn.ReLU() 
+        self.n_lyrs = n_lyrs 
+        self.n_hidden = 256 
+        p = 0. if self.n_lyrs < 2 else 0.08
+        self.rnn = nn.GRU(131, self.n_hidden,
                           num_layers = self.n_lyrs,
                           batch_first = True,
-                          dropout = 0.1)
-        self.lin = nn.Linear(128, 2)
+                          dropout = p)
+        self.lin = nn.Linear(self.n_hidden, 2)
 
     def forward(self, fts, weight, state = None):
-        mu, logvar = self.encoder.encode(fts.view(-1,130))
-        mu = mu.view(*fts.shape[:-1], -1)
-        logvar = logvar.view(*fts.shape[:-1], -1)
-        x = torch.cat( (mu, logvar, weight), dim = 2)
+        '''Returns unnormalized action sequence of size (batch, seq_len, 2)
+        args:
+            fts (batch, seq_len, 130)
+            weight (batch, seq_len, 1)
+        '''
+        fts, weight = fts.to(torch.float32), weight.to(torch.float32)
+        if self.training or self.meta_bias is None:
+            self.meta_bias = self.conv(self.meta).reshape(1,130)
+        fts *= self.meta_weight
+        fts += self.meta_bias.repeat(*fts.shape[:2], 1)
+        x = torch.cat( (self.relu(fts), weight), dim = 2)
         if state is None:
             state = torch.zeros((self.n_lyrs, x.shape[0], self.n_hidden),
                                 device = x.device)
         y, state = self.rnn(x, state)
-        out = self.lin(y.view(-1, y.shape[-1]))
+        out = self.lin(y)
         return out, state
 
 class Conv1dUntiedBias(nn.Module):
